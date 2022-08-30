@@ -1,0 +1,89 @@
+name: CI-CD
+on:
+  push:
+    branches: [ "master" ]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  ci-cd:
+    runs-on: self-hosted
+    if: ${{ (github.ref_type == 'tag') }}
+    steps:
+      - uses: actions/checkout@master
+      - uses: FranzDiebold/github-env-vars-action@v2
+      - uses: actions/setup-python@v4
+
+      - run: |
+            # prepare
+            python -m pip install --upgrade pip
+            pip install ansible
+      - uses: hiberbee/github-action-helm@1.13.0
+      - name: Kaniko build docker image
+        uses: aevea/action-kaniko@master
+        with:
+          registry: ghcr.io
+          password: ${{ secrets.GITHUB_TOKEN }}
+          image: ${{ env.CI_REPOSITORY_NAME }}
+          cache: true
+          cache_registry: cache
+          strip_tag_prefix: v
+
+      - name: Template helm configs
+        run: |
+            cat > _atransform.yaml <<'EOF'
+            ---
+            - hosts: localhost
+              gather_facts: no
+              tasks:
+                - local_action: template src="{{ item }}.j2" dest="{{ item }}" mode="0600"
+                  with_items:
+                  - values.yaml
+                  - kubeconfig
+            EOF
+            cat > kubeconfig.j2 <<'EOF'
+            {{ lookup('env','KUBECONFIG_FILE_DATA') | b64decode }}
+            EOF
+
+            cat > values.yaml.j2 <<'EOF'
+            image:
+              tag: {{ lookup('env','APP_TAG') | regex_replace('^v','') | regex_search('^\d+\.\d+\.\d+$') |  default('latest', true) }}
+              pullPolicy: Always
+
+            service:
+              type: NodePort
+              nodePort: {{ lookup('env','APP_INNER_PORT') }}
+
+            DB:
+              host:     "{{ lookup('env','DB_HOST') }}"
+              name:     "{{ lookup('env','DB_NAME') }}"
+              user:     "{{ lookup('env','DB_USER') }}"
+              password: "{{ lookup('env','DB_PASSWORD') }}"
+            EOF
+
+      - name: Helm deploy app
+        env:
+          KUBECONFIG_FILE_DATA: '${{secrets.KUBECONFIG_FILE_DATA}}'
+          APP_TAG: '${{env.CI_REF_NAME}}'
+          DB_HOST: '${{secrets.DB_HOST}}'
+          DB_NAME: '${{secrets.DB_NAME}}'
+          DB_USER: '${{secrets.DB_USER}}'
+          DB_PASSWORD: '${{secrets.DB_PASSWORD}}'
+        run: |
+            # render configs
+            ANSIBLE_LOCALHOST_WARNING=false ansible-playbook _atransform.yaml
+            # check version
+            echo "Install version/tag - $(grep tag values.yaml)"
+            # helm install/upgrade
+            KUBECONFIG=./kubeconfig  helm upgrade --install --wait --timeout 300s testapp ./charts/app --namespace app0 -f values.yaml
+
+      - name: Send job status to telegram
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          format: markdown
+          message: |
+            ### ${{github.repository}} - ${{env.CI_REF_NAME}}
+
+            **${{ github.job }}** status: **${{ job.status }}**
